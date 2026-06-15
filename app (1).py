@@ -1,0 +1,322 @@
+"""
+Gestión de Pedidos y Control de Presupuestos Zonales
+Versión conectada a la base real: Gestión_zonal_DR_Julio.xlsx
+
+CÓMO CORRER:
+    pip install streamlit pandas openpyxl
+    1) Deja este app.py y el archivo Excel en la MISMA carpeta.
+    2) streamlit run app.py
+
+LÓGICA DE NEGOCIO (confirmada con Marce):
+    - Llave maestra de centro de costo:  CC  (numérico)
+    - Llave de producto:                 Insumo (texto) -> precio en hoja Precios
+    - Mes:                               Fmes (1..12);  julio = 7
+    - Proyección = suma de Total del pedido de insumos (en pesos)
+    - Presupuesto = |Monto M$| del Plan  x  1.000.000  (viene en millones y en negativo)
+    - Rol zonal = "Responsable Nivel 2"; cada zonal ve solo SUS CC.
+"""
+
+import streamlit as st
+import pandas as pd
+from datetime import datetime
+import io
+
+# ======================================================================
+# CONFIGURACIÓN  (lo único que tocarías si cambia el archivo o el mes)
+# ======================================================================
+EXCEL_PATH = "Gestión_zonal_DR_Julio.xlsx"
+MES_DEFAULT = 7                 # julio
+PLAN_A_PESOS = 1_000_000        # Monto M$ está en millones de pesos
+
+MESES = {1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
+         7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"}
+
+st.set_page_config(page_title="Pedidos Zonales", page_icon="📦", layout="wide")
+
+
+# ======================================================================
+# CARGA DE DATOS  (utils/data_loader.py)
+# ======================================================================
+@st.cache_data
+def cargar_insumos() -> pd.DataFrame:
+    df = pd.read_excel(EXCEL_PATH, sheet_name="Insumos", header=4)
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
+    for c in ["CC", "Cantidad", "Total", "Precio Unitario"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["CC", "Insumo"])
+    df["CC"] = df["CC"].astype(int)
+    return df
+
+
+@st.cache_data
+def cargar_precios() -> pd.DataFrame:
+    df = pd.read_excel(EXCEL_PATH, sheet_name="Precios")
+    df["Precio Unitario"] = pd.to_numeric(df["Precio Unitario"], errors="coerce")
+    return df.dropna(subset=["Insumo"])
+
+
+@st.cache_data
+def cargar_plan() -> pd.DataFrame:
+    df = pd.read_excel(EXCEL_PATH, sheet_name="Plan")
+    df["CC"] = pd.to_numeric(df["CC"], errors="coerce")
+    df["Monto M$"] = pd.to_numeric(df["Monto M$"], errors="coerce")
+    df = df.dropna(subset=["CC"])
+    df["CC"] = df["CC"].astype(int)
+    # Presupuesto en pesos (valor absoluto porque viene negativo)
+    df["presupuesto_pesos"] = df["Monto M$"].abs() * PLAN_A_PESOS
+    return df
+
+
+def precio_map() -> dict:
+    """Precio vigente por nombre de insumo, desde la hoja Precios."""
+    pr = cargar_precios()
+    return dict(zip(pr["Insumo"], pr["Precio Unitario"]))
+
+
+# "Tabla" de pedidos enviados en la sesión (en producción -> SQLite / CSV)
+if "pedidos_enviados" not in st.session_state:
+    st.session_state.pedidos_enviados = {}   # clave: (CC, mes) -> DataFrame editado
+
+
+# ======================================================================
+# AUTENTICACIÓN / ROLES  (utils/auth.py)
+# ======================================================================
+@st.cache_data
+def lista_responsables() -> list:
+    ins = cargar_insumos()
+    return sorted(ins["Responsable Nivel 2"].dropna().unique().tolist())
+
+
+def ccs_de(usuario: str, es_admin: bool) -> pd.DataFrame:
+    """CC visibles: todos si es admin; solo los del responsable si es zonal."""
+    ins = cargar_insumos()
+    cc = ins[["CC", "Nombre CC", "Cliente", "Región", "Responsable Nivel 2"]].drop_duplicates("CC")
+    if es_admin:
+        return cc
+    return cc[cc["Responsable Nivel 2"] == usuario]
+
+
+def presupuesto_cc(cc: int, mes: int):
+    """Devuelve el presupuesto en pesos para un CC y mes, o None si no hay plan."""
+    pl = cargar_plan()
+    fila = pl[(pl["CC"] == cc) & (pl["Fmes"] == mes)]["presupuesto_pesos"]
+    return float(fila.iloc[0]) if not fila.empty else None
+
+
+# ======================================================================
+# MÓDULO PEDIDOS  (views/pedidos.py)
+# ======================================================================
+def vista_pedidos(usuario: str, es_admin: bool):
+    st.header("📝 Generación de Pedidos")
+
+    ccs = ccs_de(usuario, es_admin)
+    if ccs.empty:
+        st.warning("No tienes Centros de Costo asignados.")
+        return
+
+    c1, c2 = st.columns(2)
+    mes = c1.selectbox("Mes", list(MESES.keys()),
+                       index=MES_DEFAULT - 1, format_func=lambda m: MESES[m])
+    etiquetas = (ccs["CC"].astype(str) + " — " + ccs["Nombre CC"].fillna("")).tolist()
+    cc_label = c2.selectbox("Centro de Costo", etiquetas)
+    cc = int(cc_label.split(" — ")[0])
+
+    # --- Plantilla base: lo que ESE CC suele pedir (desde la hoja Insumos)
+    clave = (cc, mes)
+    if clave in st.session_state.pedidos_enviados:
+        base = st.session_state.pedidos_enviados[clave].copy()
+        st.info("Mostrando el pedido ya enviado para este CC y mes. Puedes ajustarlo y reenviar.")
+    else:
+        ins = cargar_insumos()
+        precios = precio_map()
+        base = ins[ins["CC"] == cc][["Insumo", "Categoria", "Proveedor", "Cantidad"]].copy()
+        base = base.drop_duplicates("Insumo")
+        # Precio vigente desde hoja Precios; si falta, queda en 0 (avisar)
+        base["Precio"] = base["Insumo"].map(precios)
+        faltan = base["Precio"].isna().sum()
+        if faltan:
+            st.caption(f"⚠️ {faltan} insumo(s) sin precio en la hoja Precios (se piden con precio 0; revísalos en Catálogo).")
+        base["Precio"] = base["Precio"].fillna(0)
+        base["Cantidad"] = pd.to_numeric(base["Cantidad"], errors="coerce").fillna(0)
+
+    if base.empty:
+        st.info("Este CC no tiene insumos históricos. Agrega filas manualmente abajo.")
+        base = pd.DataFrame(columns=["Insumo", "Categoria", "Proveedor", "Cantidad", "Precio"])
+
+    st.subheader("Edita solo la columna Cantidad")
+    editado = st.data_editor(
+        base[["Insumo", "Categoria", "Proveedor", "Precio", "Cantidad"]],
+        column_config={
+            "Insumo": st.column_config.TextColumn("Insumo", disabled=True, width="large"),
+            "Categoria": st.column_config.TextColumn("Categoría", disabled=True),
+            "Proveedor": st.column_config.TextColumn("Proveedor", disabled=True),
+            "Precio": st.column_config.NumberColumn("Precio unit.", format="$%d", disabled=True),
+            "Cantidad": st.column_config.NumberColumn("Cantidad", min_value=0, step=1),
+        },
+        hide_index=True, use_container_width=True, num_rows="dynamic",
+        key=f"editor_{cc}_{mes}",
+    )
+
+    # --- Cálculo: proyección (pesos) vs presupuesto (pesos)
+    editado["Cantidad"] = pd.to_numeric(editado["Cantidad"], errors="coerce").fillna(0)
+    editado["Total"] = editado["Cantidad"] * editado["Precio"].fillna(0)
+    proyeccion = float(editado["Total"].sum())
+    presup = presupuesto_cc(cc, mes)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Proyección pedido", f"${proyeccion:,.0f}")
+    if presup is None:
+        m2.metric("Presupuesto", "Sin plan")
+        m3.metric("Saldo", "—")
+        st.warning("Este CC no tiene presupuesto cargado en el Plan para este mes.")
+    else:
+        saldo = presup - proyeccion
+        m2.metric("Presupuesto (Plan)", f"${presup:,.0f}")
+        m3.metric("Saldo", f"${saldo:,.0f}", delta=f"{saldo:,.0f}")
+        if proyeccion > presup:
+            st.error(f"⚠️ Sobregiro de ${proyeccion - presup:,.0f}. Requiere aprobación del administrador.")
+
+    if st.button("✅ Enviar pedido", type="primary", use_container_width=True):
+        st.session_state.pedidos_enviados[clave] = editado.copy()
+        st.success(f"Pedido del CC {cc} ({MESES[mes]}) enviado. Proyección: ${proyeccion:,.0f}")
+
+
+# ======================================================================
+# MÓDULO CATÁLOGO  (views/catalogo.py)  — solo admin
+# ======================================================================
+def vista_catalogo():
+    st.header("⚙️ Administración de Catálogo (Precios)")
+    st.caption("Actualiza precios, agrega o elimina insumos. (En el MVP los cambios no persisten al recargar.)")
+    pr = cargar_precios()
+    editado = st.data_editor(
+        pr,
+        column_config={
+            "Precio Unitario": st.column_config.NumberColumn("Precio Unitario", format="$%d", min_value=0),
+        },
+        num_rows="dynamic", use_container_width=True, hide_index=True,
+    )
+    if st.button("💾 Guardar catálogo"):
+        # En producción: escribir de vuelta a la hoja Precios + st.cache_data.clear()
+        st.success(f"Catálogo guardado: {len(editado)} insumos (simulado).")
+
+
+# ======================================================================
+# MÓDULO DASHBOARD  (views/dashboard.py)  — solo admin
+# ======================================================================
+def vista_dashboard():
+    st.header("📊 Dashboard y Control Presupuestario")
+    mes = st.selectbox("Mes", list(MESES.keys()),
+                       index=MES_DEFAULT - 1, format_func=lambda m: MESES[m])
+
+    ins = cargar_insumos()
+    pl = cargar_plan()
+
+    # Proyección por CC: usa el pedido enviado si existe; si no, el histórico de Insumos
+    base = ins.groupby(["CC", "Nombre CC", "Responsable Nivel 2"], as_index=False)["Total"].sum()
+    base = base.rename(columns={"Total": "proyeccion"})
+    for (cc, m), df in st.session_state.pedidos_enviados.items():
+        if m == mes:
+            base.loc[base["CC"] == cc, "proyeccion"] = float(df["Total"].sum())
+
+    plan_mes = pl[pl["Fmes"] == mes][["CC", "presupuesto_pesos"]]
+    tabla = base.merge(plan_mes, on="CC", how="left")
+    tabla["saldo"] = tabla["presupuesto_pesos"] - tabla["proyeccion"]
+    tabla["sobregiro"] = tabla["saldo"] < 0
+
+    # Filtros
+    f1, f2 = st.columns(2)
+    resp_op = sorted(tabla["Responsable Nivel 2"].dropna().unique().tolist())
+    resp = f1.multiselect("Responsable", resp_op, default=resp_op)
+    tabla = tabla[tabla["Responsable Nivel 2"].isin(resp)]
+    cc_op = (tabla["CC"].astype(str) + " — " + tabla["Nombre CC"].fillna("")).tolist()
+    cc_sel = f2.multiselect("Centro de Costo", cc_op, default=cc_op)
+    ccs_filtro = [int(x.split(" — ")[0]) for x in cc_sel]
+    tabla = tabla[tabla["CC"].isin(ccs_filtro)]
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Proyección total", f"${tabla['proyeccion'].sum():,.0f}")
+    k2.metric("Presupuesto total", f"${tabla['presupuesto_pesos'].sum():,.0f}")
+    k3.metric("CC en sobregiro", int(tabla["sobregiro"].sum()))
+
+    sobre = tabla[tabla["sobregiro"]]
+    if not sobre.empty:
+        for _, r in sobre.iterrows():
+            st.error(f"⚠️ {r['Nombre CC']} (CC {r['CC']}): sobregiro de ${-r['saldo']:,.0f}")
+
+    st.dataframe(
+        tabla[["CC", "Nombre CC", "Responsable Nivel 2", "proyeccion", "presupuesto_pesos", "saldo"]]
+        .rename(columns={"Responsable Nivel 2": "Responsable",
+                         "proyeccion": "Proyección", "presupuesto_pesos": "Presupuesto", "saldo": "Saldo"}),
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Proyección": st.column_config.NumberColumn(format="$%d"),
+            "Presupuesto": st.column_config.NumberColumn(format="$%d"),
+            "Saldo": st.column_config.NumberColumn(format="$%d"),
+        },
+    )
+
+
+# ======================================================================
+# MÓDULO EXPORTAR  (views/exportar.py)
+# ======================================================================
+def vista_exportar():
+    st.header("📥 Exportar Consolidado de Pedidos Enviados")
+    enviados = st.session_state.pedidos_enviados
+    if not enviados:
+        st.info("Aún no hay pedidos enviados en esta sesión.")
+        return
+
+    filas = []
+    for (cc, mes), df in enviados.items():
+        tmp = df.copy()
+        tmp["CC"] = cc
+        tmp["Mes"] = MESES[mes]
+        filas.append(tmp)
+    consolidado = pd.concat(filas, ignore_index=True)
+    consolidado = consolidado[["CC", "Mes", "Insumo", "Categoria", "Proveedor", "Precio", "Cantidad", "Total"]]
+
+    st.dataframe(consolidado, use_container_width=True, hide_index=True)
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        consolidado.to_excel(writer, sheet_name="Consolidado", index=False)
+    st.download_button(
+        "⬇️ Descargar consolidado (Excel)",
+        data=buffer.getvalue(),
+        file_name=f"consolidado_pedidos_{datetime.now():%Y%m%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+
+
+# ======================================================================
+# ROUTER + SIDEBAR  (app.py)
+# ======================================================================
+def main():
+    st.sidebar.title("📦 Pedidos Zonales")
+
+    # Selector de perfil (MVP). En producción -> login real.
+    perfiles = ["Administrador"] + lista_responsables()
+    perfil = st.sidebar.selectbox("Perfil", perfiles)
+    es_admin = (perfil == "Administrador")
+    st.sidebar.caption(f"Sesión: **{perfil}**" + ("  ·  acceso total" if es_admin else "  ·  zonal"))
+    st.sidebar.divider()
+
+    if es_admin:
+        opciones = ["Generación de Pedidos", "Catálogo", "Dashboard", "Exportar"]
+    else:
+        opciones = ["Generación de Pedidos"]
+    seccion = st.sidebar.radio("Módulos", opciones)
+
+    if seccion == "Generación de Pedidos":
+        vista_pedidos(perfil, es_admin)
+    elif seccion == "Catálogo":
+        vista_catalogo()
+    elif seccion == "Dashboard":
+        vista_dashboard()
+    elif seccion == "Exportar":
+        vista_exportar()
+
+
+if __name__ == "__main__":
+    main()
